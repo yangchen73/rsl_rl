@@ -7,5 +7,6 @@
 
 from .distillation import Distillation
 from .ppo import PPO
+from .recurrent_l2t import RecurrentL2T
 
-__all__ = ["PPO", "Distillation"]
+__all__ = ["PPO", "Distillation", "RecurrentL2T"]
