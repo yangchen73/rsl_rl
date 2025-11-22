@@ -120,6 +120,10 @@ class RecurrentL2T:
         # L2T parameters
         self.mixture_coef = mixture_coef
         self.student_loss_coef = student_loss_coef
+        
+        # Training progress tracking for mixture policy
+        self.current_progress_remaining = 1.0  # 1.0 at start, 0.0 at end
+        self.num_timesteps = 0  # Total timesteps processed
 
         # Create rollout storage
         self.storage: RolloutStorage | None = None
@@ -208,6 +212,10 @@ class RecurrentL2T:
         self.storage.compute_returns(
             last_values, self.gamma, self.lam, normalize_advantage=not self.normalize_advantage_per_mini_batch
         )
+
+    def update_training_progress(self, current_iteration: int, total_iterations: int) -> None:
+        # Update the training progress for mixture policy scheduling
+        self.current_progress_remaining = 1.0 - (current_iteration / total_iterations)
 
     def update(self) -> dict[str, float]:
         mean_value_loss = 0
