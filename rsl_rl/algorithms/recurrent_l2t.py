@@ -20,12 +20,13 @@ from rsl_rl.utils import string_to_callable
 class RecurrentL2T:
     """Proximal Policy Optimization algorithm (https://arxiv.org/abs/1707.06347)."""
 
-    policy: ActorCritic | ActorCriticRecurrent
-    """The actor critic module."""
+    teacher_policy: ActorCritic | ActorCriticRecurrent
+    student_policy: ActorCritic | ActorCriticRecurrent
 
     def __init__(
         self,
-        policy: ActorCritic | ActorCriticRecurrent,
+        teacher_policy: ActorCritic | ActorCriticRecurrent,
+        student_policy: ActorCritic | ActorCriticRecurrent,
         num_learning_epochs: int = 5,
         num_mini_batches: int = 4,
         clip_param: float = 0.2,
@@ -44,6 +45,9 @@ class RecurrentL2T:
         rnd_cfg: dict | None = None,
         # Symmetry parameters
         symmetry_cfg: dict | None = None,
+        # L2T parameters
+        mixture_coef: float = 1.0,
+        student_loss_coef: float = 1.0,
         # Distributed training parameters
         multi_gpu_cfg: dict | None = None,
     ) -> None:
@@ -89,7 +93,7 @@ class RecurrentL2T:
                     f"{symmetry_cfg['data_augmentation_func']}"
                 )
             # Check if the policy is compatible with symmetry
-            if isinstance(policy, ActorCriticRecurrent):
+            if isinstance(teacher_policy, ActorCriticRecurrent):
                 raise ValueError("Symmetry augmentation is not supported for recurrent policies.")
             # Store symmetry configuration
             self.symmetry = symmetry_cfg
@@ -97,11 +101,21 @@ class RecurrentL2T:
             self.symmetry = None
 
         # PPO components
-        self.policy = policy
-        self.policy.to(self.device)
+        self.teacher_policy = teacher_policy
+        self.teacher_policy.to(self.device)
+        
+        self.student_policy = student_policy
+        self.student_policy.to(self.device)
+
+        # For compatibility with runner (which expects self.policy)
+        self.policy = self.teacher_policy
 
         # Create optimizer
-        self.optimizer = optim.Adam(self.policy.parameters(), lr=learning_rate)
+        self.optimizer = optim.Adam(self.teacher_policy.parameters(), lr=learning_rate)
+        
+        # L2T parameters
+        self.mixture_coef = mixture_coef
+        self.student_loss_coef = student_loss_coef
 
         # Create rollout storage
         self.storage: RolloutStorage | None = None
@@ -141,14 +155,14 @@ class RecurrentL2T:
         )
 
     def act(self, obs: TensorDict) -> torch.Tensor:
-        if self.policy.is_recurrent:
-            self.transition.hidden_states = self.policy.get_hidden_states()
+        if self.teacher_policy.is_recurrent:
+            self.transition.hidden_states = self.teacher_policy.get_hidden_states()
         # Compute the actions and values
-        self.transition.actions = self.policy.act(obs).detach()
-        self.transition.values = self.policy.evaluate(obs).detach()
-        self.transition.actions_log_prob = self.policy.get_actions_log_prob(self.transition.actions).detach()
-        self.transition.action_mean = self.policy.action_mean.detach()
-        self.transition.action_sigma = self.policy.action_std.detach()
+        self.transition.actions = self.teacher_policy.act(obs).detach()
+        self.transition.values = self.teacher_policy.evaluate(obs).detach()
+        self.transition.actions_log_prob = self.teacher_policy.get_actions_log_prob(self.transition.actions).detach()
+        self.transition.action_mean = self.teacher_policy.action_mean.detach()
+        self.transition.action_sigma = self.teacher_policy.action_std.detach()
         # Record observations before env.step()
         self.transition.observations = obs
         return self.transition.actions
@@ -157,7 +171,7 @@ class RecurrentL2T:
         self, obs: TensorDict, rewards: torch.Tensor, dones: torch.Tensor, extras: dict[str, torch.Tensor]
     ) -> None:
         # Update the normalizers
-        self.policy.update_normalization(obs)
+        self.teacher_policy.update_normalization(obs)
         if self.rnd:
             self.rnd.update_normalization(obs)
 
@@ -182,11 +196,11 @@ class RecurrentL2T:
         # Record the transition
         self.storage.add_transitions(self.transition)
         self.transition.clear()
-        self.policy.reset(dones)
+        self.teacher_policy.reset(dones)
 
     def compute_returns(self, obs: TensorDict) -> None:
         # Compute value for the last step
-        last_values = self.policy.evaluate(obs).detach()
+        last_values = self.teacher_policy.evaluate(obs).detach()
         self.storage.compute_returns(
             last_values, self.gamma, self.lam, normalize_advantage=not self.normalize_advantage_per_mini_batch
         )
@@ -201,7 +215,7 @@ class RecurrentL2T:
         mean_symmetry_loss = 0 if self.symmetry else None
 
         # Get mini batch generator
-        if self.policy.is_recurrent:
+        if self.teacher_policy.is_recurrent:
             generator = self.storage.recurrent_mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
         else:
             generator = self.storage.mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
@@ -247,13 +261,13 @@ class RecurrentL2T:
 
             # Recompute actions log prob and entropy for current batch of transitions
             # Note: We need to do this because we updated the policy with the new parameters
-            self.policy.act(obs_batch, masks=masks_batch, hidden_state=hidden_states_batch[0])
-            actions_log_prob_batch = self.policy.get_actions_log_prob(actions_batch)
-            value_batch = self.policy.evaluate(obs_batch, masks=masks_batch, hidden_state=hidden_states_batch[1])
+            self.teacher_policy.act(obs_batch, masks=masks_batch, hidden_state=hidden_states_batch[0])
+            actions_log_prob_batch = self.teacher_policy.get_actions_log_prob(actions_batch)
+            value_batch = self.teacher_policy.evaluate(obs_batch, masks=masks_batch, hidden_state=hidden_states_batch[1])
             # Note: We only keep the entropy of the first augmentation (the original one)
-            mu_batch = self.policy.action_mean[:original_batch_size]
-            sigma_batch = self.policy.action_std[:original_batch_size]
-            entropy_batch = self.policy.entropy[:original_batch_size]
+            mu_batch = self.teacher_policy.action_mean[:original_batch_size]
+            sigma_batch = self.teacher_policy.action_std[:original_batch_size]
+            entropy_batch = self.teacher_policy.entropy[:original_batch_size]
 
             # Compute KL divergence and adapt the learning rate
             if self.desired_kl is not None and self.schedule == "adaptive":
@@ -323,7 +337,7 @@ class RecurrentL2T:
                     num_aug = int(obs_batch.shape[0] / original_batch_size)
 
                 # Actions predicted by the actor for symmetrically-augmented observations
-                mean_actions_batch = self.policy.act_inference(obs_batch.detach().clone())
+                mean_actions_batch = self.teacher_policy.act_inference(obs_batch.detach().clone())
 
                 # Compute the symmetrically augmented actions
                 # Note: We are assuming the first augmentation is the original one. We do not use the action_batch from
@@ -373,7 +387,7 @@ class RecurrentL2T:
                 self.reduce_parameters()
 
             # Apply the gradients for PPO
-            nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
+            nn.utils.clip_grad_norm_(self.teacher_policy.parameters(), self.max_grad_norm)
             self.optimizer.step()
             # Apply the gradients for RND
             if self.rnd_optimizer:
@@ -419,15 +433,20 @@ class RecurrentL2T:
     def broadcast_parameters(self) -> None:
         """Broadcast model parameters to all GPUs."""
         # Obtain the model parameters on current GPU
-        model_params = [self.policy.state_dict()]
+        model_params = [self.teacher_policy.state_dict()]
+        model_params.append(self.student_policy.state_dict())
         if self.rnd:
             model_params.append(self.rnd.predictor.state_dict())
         # Broadcast the model parameters
         torch.distributed.broadcast_object_list(model_params, src=0)
         # Load the model parameters on all GPUs from source GPU
-        self.policy.load_state_dict(model_params[0])
+        idx = 0
+        self.teacher_policy.load_state_dict(model_params[idx])
+        idx += 1
+        self.student_policy.load_state_dict(model_params[idx])
+        idx += 1
         if self.rnd:
-            self.rnd.predictor.load_state_dict(model_params[1])
+            self.rnd.predictor.load_state_dict(model_params[idx])
 
     def reduce_parameters(self) -> None:
         """Collect gradients from all GPUs and average them.
@@ -435,7 +454,7 @@ class RecurrentL2T:
         This function is called after the backward pass to synchronize the gradients across all GPUs.
         """
         # Create a tensor to store the gradients
-        grads = [param.grad.view(-1) for param in self.policy.parameters() if param.grad is not None]
+        grads = [param.grad.view(-1) for param in self.teacher_policy.parameters() if param.grad is not None]
         if self.rnd:
             grads += [param.grad.view(-1) for param in self.rnd.parameters() if param.grad is not None]
         all_grads = torch.cat(grads)
@@ -445,7 +464,7 @@ class RecurrentL2T:
         all_grads /= self.gpu_world_size
 
         # Get all parameters
-        all_params = self.policy.parameters()
+        all_params = self.teacher_policy.parameters()
         if self.rnd:
             all_params = chain(all_params, self.rnd.parameters())
 

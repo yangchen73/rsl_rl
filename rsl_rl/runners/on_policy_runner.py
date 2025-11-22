@@ -39,9 +39,22 @@ class OnPolicyRunner:
 
         # Query observations from environment for algorithm construction
         obs = self.env.get_observations()
+        
+        # Prepare default_sets for resolve_obs_groups
         default_sets = ["critic"]
         if "rnd_cfg" in self.alg_cfg and self.alg_cfg["rnd_cfg"] is not None:
             default_sets.append("rnd_state")
+        
+        # For RecurrentL2T, set a temporary placeholder if obs_groups is empty
+        # (L2T will override obs_groups in _construct_algorithm)
+        alg_class_name = self.alg_cfg.get("class_name", "PPO")
+        if alg_class_name == "RecurrentL2T" and (not self.cfg.get("obs_groups") or len(self.cfg.get("obs_groups", {})) == 0):
+            # Use first available observation key as placeholder
+            obs_keys = list(obs.keys()) if obs is not None else []
+            first_key = obs_keys[0] if obs_keys else "policy"
+            self.cfg["obs_groups"] = {"policy": [first_key], "critic": [first_key]}
+        
+        # Resolve obs_groups for all algorithms
         self.cfg["obs_groups"] = resolve_obs_groups(obs, self.cfg["obs_groups"], default_sets)
 
         # Create the algorithm
@@ -414,14 +427,54 @@ class OnPolicyRunner:
 
         # Initialize the policy
         actor_critic_class = eval(self.policy_cfg.pop("class_name"))
-        actor_critic: ActorCritic | ActorCriticRecurrent = actor_critic_class(
-            obs, self.cfg["obs_groups"], self.env.num_actions, **self.policy_cfg
-        ).to(self.device)
-
+        
         # Initialize the algorithm
         alg_class = eval(self.alg_cfg.pop("class_name"))
-        alg: PPO = alg_class(actor_critic, device=self.device, **self.alg_cfg, multi_gpu_cfg=self.multi_gpu_cfg)
-
+        
+        # Check if this is RecurrentL2T and needs a student policy
+        if alg_class.__name__ == "RecurrentL2T":
+            
+            teacher_obs_groups = {
+                "policy": ["teacher"],
+                "critic": ["teacher"],
+            }
+            
+            student_obs_groups = {
+                "policy": ["student"],
+                "critic": ["student"],  
+            }
+            
+            # Create teacher policy with teacher obs_groups
+            actor_critic: ActorCritic | ActorCriticRecurrent = actor_critic_class(
+                obs, teacher_obs_groups, self.env.num_actions, **self.policy_cfg
+            ).to(self.device)
+            
+            # For L2T, check if we need to create a student policy
+    
+            student_policy_cfg = self.cfg.get("student_policy")
+            if student_policy_cfg is None:
+                raise ValueError("RecurrentL2T requires 'student_policy' configuration")
+            # Create student policy with student obs_groups
+            student_actor_critic_class = eval(student_policy_cfg.pop("class_name"))
+            student_actor_critic = student_actor_critic_class(
+                obs, student_obs_groups, self.env.num_actions, **student_policy_cfg
+            ).to(self.device)
+            # Pass both policies with explicit parameter names
+            
+            alg: RecurrentL2T = alg_class(
+                teacher_policy=actor_critic,
+                student_policy=student_actor_critic,
+                device=self.device,
+                **self.alg_cfg,
+                multi_gpu_cfg=self.multi_gpu_cfg
+            )
+        else:
+            # Standard PPO or other algorithms
+            actor_critic: ActorCritic | ActorCriticRecurrent = actor_critic_class(
+                obs, self.cfg["obs_groups"], self.env.num_actions, **self.policy_cfg
+            ).to(self.device)
+            alg: PPO = alg_class(actor_critic, device=self.device, **self.alg_cfg, multi_gpu_cfg=self.multi_gpu_cfg)
+        
         # Initialize the storage
         alg.init_storage(
             "rl",
