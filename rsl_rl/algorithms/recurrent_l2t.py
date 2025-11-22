@@ -110,8 +110,12 @@ class RecurrentL2T:
         # For compatibility with runner (which expects self.policy)
         self.policy = self.teacher_policy
 
-        # Create optimizer
-        self.optimizer = optim.Adam(self.teacher_policy.parameters(), lr=learning_rate)
+        # Create optimizers
+        self.teacher_optimizer = optim.Adam(self.teacher_policy.parameters(), lr=learning_rate)
+        self.student_optimizer = optim.Adam(self.student_policy.parameters(), lr=learning_rate)
+        
+        # Keep reference to teacher_optimizer as self.optimizer for compatibility
+        self.optimizer = self.teacher_optimizer
         
         # L2T parameters
         self.mixture_coef = mixture_coef
@@ -455,6 +459,7 @@ class RecurrentL2T:
         """
         # Create a tensor to store the gradients
         grads = [param.grad.view(-1) for param in self.teacher_policy.parameters() if param.grad is not None]
+        grads += [param.grad.view(-1) for param in self.student_policy.parameters() if param.grad is not None]
         if self.rnd:
             grads += [param.grad.view(-1) for param in self.rnd.parameters() if param.grad is not None]
         all_grads = torch.cat(grads)
@@ -464,7 +469,7 @@ class RecurrentL2T:
         all_grads /= self.gpu_world_size
 
         # Get all parameters
-        all_params = self.teacher_policy.parameters()
+        all_params = chain(self.teacher_policy.parameters(), self.student_policy.parameters())
         if self.rnd:
             all_params = chain(all_params, self.rnd.parameters())
 
@@ -473,6 +478,10 @@ class RecurrentL2T:
         for param in all_params:
             if param.grad is not None:
                 numel = param.numel()
+                # Copy data back from shared buffer
+                param.grad.data.copy_(all_grads[offset : offset + numel].view_as(param.grad.data))
+                # Update the offset for the next parameter
+                offset += numel
                 # Copy data back from shared buffer
                 param.grad.data.copy_(all_grads[offset : offset + numel].view_as(param.grad.data))
                 # Update the offset for the next parameter
