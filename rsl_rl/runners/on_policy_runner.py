@@ -352,6 +352,10 @@ class OnPolicyRunner:
     def train_mode(self) -> None:
         # PPO
         self.alg.policy.train()
+        # L2T: also set student policy to train mode
+        student_policy = getattr(self.alg, "student_policy", None)
+        if student_policy is not None:
+            student_policy.train()
         # RND
         if hasattr(self.alg, "rnd") and self.alg.rnd:
             self.alg.rnd.train()
@@ -359,6 +363,10 @@ class OnPolicyRunner:
     def eval_mode(self) -> None:
         # PPO
         self.alg.policy.eval()
+        # L2T: also set student policy to eval mode
+        student_policy = getattr(self.alg, "student_policy", None)
+        if student_policy is not None:
+            student_policy.eval()
         # RND
         if hasattr(self.alg, "rnd") and self.alg.rnd:
             self.alg.rnd.eval()

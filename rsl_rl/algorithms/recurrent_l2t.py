@@ -46,7 +46,7 @@ class RecurrentL2T:
         # Symmetry parameters
         symmetry_cfg: dict | None = None,
         # L2T parameters
-        mixture_coef: float = 1.0,
+        mixture_coef: float = 0.2,
         student_loss_coef: float = 1.0,
         # Distributed training parameters
         multi_gpu_cfg: dict | None = None,
@@ -163,14 +163,63 @@ class RecurrentL2T:
         )
 
     def act(self, obs: TensorDict) -> torch.Tensor:
+        # Determine whether to use student policy based on mixture coefficient
+        use_student = (
+            self.mixture_coef > 0.0
+            and self.num_timesteps > 0
+            and torch.rand(1, device=self.device)[0] < self.mixture_coef * (1.0 - self.current_progress_remaining)
+        )
+        
+        # Extract student observations (format is determined: obs["student"])
+        student_obs = TensorDict({"student": obs["student"]}, batch_size=obs.batch_size, device=obs.device)
+        
+        # Save teacher hidden states (for teacher PPO loss if teacher is recurrent)
         if self.teacher_policy.is_recurrent:
             self.transition.hidden_states = self.teacher_policy.get_hidden_states()
-        # Compute the actions and values
-        self.transition.actions = self.teacher_policy.act(obs).detach()
+        else:
+            self.transition.hidden_states = (None, None)
+        
+        # CRITICAL: Always update and save student LSTM states, regardless of which policy is used for action
+        # This is because training needs student LSTM states to compute student loss
+        if self.student_policy.is_recurrent:
+            # Save student hidden states BEFORE forward pass (current state)
+            # Note: On first call, this may be None, which will be handled in _save_student_hidden_states
+            self.transition.student_hidden_states = self.student_policy.get_hidden_states()
+            
+            if use_student:
+                # Use student policy for action sampling
+                # Sample action from student policy (this updates LSTM states internally)
+                self.transition.actions = self.student_policy.act(student_obs).detach()
+                # Get log prob from student policy
+                self.transition.actions_log_prob = self.student_policy.get_actions_log_prob(self.transition.actions).detach()
+                self.transition.action_mean = self.student_policy.action_mean.detach()
+                self.transition.action_sigma = self.student_policy.action_std.detach()
+            else:
+                # Forward pass through student LSTM to update hidden states (no action sampling)
+                # This maintains student's hidden state consistency for training
+                _ = self.student_policy.act(student_obs)
+                # Use teacher policy for action sampling
+                self.transition.actions = self.teacher_policy.act(obs).detach()
+                self.transition.actions_log_prob = self.teacher_policy.get_actions_log_prob(self.transition.actions).detach()
+                self.transition.action_mean = self.teacher_policy.action_mean.detach()
+                self.transition.action_sigma = self.teacher_policy.action_std.detach()
+        else:
+            # Non-recurrent student policy
+            self.transition.student_hidden_states = None
+            if use_student:
+                self.transition.actions = self.student_policy.act(student_obs).detach()
+                self.transition.actions_log_prob = self.student_policy.get_actions_log_prob(self.transition.actions).detach()
+                self.transition.action_mean = self.student_policy.action_mean.detach()
+                self.transition.action_sigma = self.student_policy.action_std.detach()
+            else:
+                self.transition.actions = self.teacher_policy.act(obs).detach()
+                self.transition.actions_log_prob = self.teacher_policy.get_actions_log_prob(self.transition.actions).detach()
+                self.transition.action_mean = self.teacher_policy.action_mean.detach()
+                self.transition.action_sigma = self.teacher_policy.action_std.detach()
+        
+        # Always use teacher policy for value estimation
         self.transition.values = self.teacher_policy.evaluate(obs).detach()
-        self.transition.actions_log_prob = self.teacher_policy.get_actions_log_prob(self.transition.actions).detach()
-        self.transition.action_mean = self.teacher_policy.action_mean.detach()
-        self.transition.action_sigma = self.teacher_policy.action_std.detach()
+        
         # Record observations before env.step()
         self.transition.observations = obs
         return self.transition.actions
@@ -178,8 +227,14 @@ class RecurrentL2T:
     def process_env_step(
         self, obs: TensorDict, rewards: torch.Tensor, dones: torch.Tensor, extras: dict[str, torch.Tensor]
     ) -> None:
+        # Update timestep counter for mixture policy scheduling
+        self.num_timesteps += rewards.shape[0] if len(rewards.shape) > 0 else 1
+        
         # Update the normalizers
         self.teacher_policy.update_normalization(obs)
+        # Also update student policy normalization with student observations
+        student_obs = TensorDict({"student": obs["student"]}, batch_size=obs.batch_size, device=obs.device)
+        self.student_policy.update_normalization(student_obs)
         if self.rnd:
             self.rnd.update_normalization(obs)
 
@@ -205,6 +260,9 @@ class RecurrentL2T:
         self.storage.add_transitions(self.transition)
         self.transition.clear()
         self.teacher_policy.reset(dones)
+        # Also reset student policy if it's recurrent
+        if self.student_policy.is_recurrent:
+            self.student_policy.reset(dones)
 
     def compute_returns(self, obs: TensorDict) -> None:
         # Compute value for the last step
@@ -218,6 +276,9 @@ class RecurrentL2T:
         self.current_progress_remaining = 1.0 - (current_iteration / total_iterations)
 
     def update(self) -> dict[str, float]:
+        # Ensure student policy is in training mode for gradient computation
+        self.student_policy.train()
+        
         mean_value_loss = 0
         mean_surrogate_loss = 0
         mean_entropy = 0
@@ -225,6 +286,8 @@ class RecurrentL2T:
         mean_rnd_loss = 0 if self.rnd else None
         # Symmetry loss
         mean_symmetry_loss = 0 if self.symmetry else None
+        # Student loss
+        mean_student_loss = 0
 
         # Get mini batch generator
         if self.teacher_policy.is_recurrent:
@@ -233,18 +296,38 @@ class RecurrentL2T:
             generator = self.storage.mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
 
         # Iterate over batches
-        for (
-            obs_batch,
-            actions_batch,
-            target_values_batch,
-            advantages_batch,
-            returns_batch,
-            old_actions_log_prob_batch,
-            old_mu_batch,
-            old_sigma_batch,
-            hidden_states_batch,
-            masks_batch,
-        ) in generator:
+        for batch_data in generator:
+            # Unpack batch data (support both old and new format)
+            if len(batch_data) == 11:
+                # New format with student hidden states
+                (
+                    obs_batch,
+                    actions_batch,
+                    target_values_batch,
+                    advantages_batch,
+                    returns_batch,
+                    old_actions_log_prob_batch,
+                    old_mu_batch,
+                    old_sigma_batch,
+                    hidden_states_batch,
+                    masks_batch,
+                    student_hidden_states_batch,
+                ) = batch_data
+            else:
+                # Old format (backward compatibility)
+                (
+                    obs_batch,
+                    actions_batch,
+                    target_values_batch,
+                    advantages_batch,
+                    returns_batch,
+                    old_actions_log_prob_batch,
+                    old_mu_batch,
+                    old_sigma_batch,
+                    hidden_states_batch,
+                    masks_batch,
+                ) = batch_data
+                student_hidden_states_batch = None
             num_aug = 1  # Number of augmentations per sample. Starts at 1 for no augmentation.
             original_batch_size = obs_batch.batch_size[0]
 
@@ -314,7 +397,11 @@ class RecurrentL2T:
                         self.learning_rate = lr_tensor.item()
 
                     # Update the learning rate for all parameter groups
+                    # Update teacher optimizer learning rate
                     for param_group in self.optimizer.param_groups:
+                        param_group["lr"] = self.learning_rate
+                    # Update student optimizer learning rate (synchronize with teacher)
+                    for param_group in self.student_optimizer.param_groups:
                         param_group["lr"] = self.learning_rate
 
             # Surrogate loss
@@ -386,6 +473,37 @@ class RecurrentL2T:
                 mseloss = torch.nn.MSELoss()
                 rnd_loss = mseloss(predicted_embedding, target_embedding)
 
+            # Student loss: make student policy mimic teacher policy actions
+            # Extract student observations (format is determined: obs_batch["student"])
+            student_obs_batch = TensorDict({"student": obs_batch["student"]}, batch_size=obs_batch.batch_size, device=obs_batch.device)
+            
+            # Get teacher actions (detached, as target)
+            teacher_actions = actions_batch.detach()
+            
+            # Compute student actions for imitation loss
+            # We need to compute actions with gradients, so we do a forward pass
+            if self.student_policy.is_recurrent:
+                # For recurrent policies, need to handle hidden states and masks
+                # Use student hidden states if available, otherwise fall back to teacher hidden states
+                if student_hidden_states_batch is not None and student_hidden_states_batch[0] is not None:
+                    student_hidden_state = student_hidden_states_batch[0]
+                else:
+                    # Fallback to teacher hidden states (should not happen in L2T)
+                    student_hidden_state = hidden_states_batch[0] if hidden_states_batch[0] is not None else None
+                # Forward pass to get action distribution (with gradients)
+                self.student_policy.act(student_obs_batch, masks=masks_batch, hidden_state=student_hidden_state)
+                # Use action_mean instead of sample() to ensure gradients flow
+                # This is the mean of the action distribution, which has gradients
+                student_actions = self.student_policy.action_mean
+            else:
+                # For non-recurrent, do forward pass and get action_mean
+                self.student_policy.act(student_obs_batch)
+                student_actions = self.student_policy.action_mean
+            
+            # Compute MSE loss between student and teacher actions
+            mse_loss_fn = torch.nn.MSELoss()
+            student_loss = mse_loss_fn(student_actions, teacher_actions)
+
             # Compute the gradients for PPO
             self.optimizer.zero_grad()
             loss.backward()
@@ -393,6 +511,9 @@ class RecurrentL2T:
             if self.rnd:
                 self.rnd_optimizer.zero_grad()
                 rnd_loss.backward()
+            # Compute the gradients for Student
+            self.student_optimizer.zero_grad()
+            student_loss.backward()
 
             # Collect gradients from all GPUs
             if self.is_multi_gpu:
@@ -404,6 +525,9 @@ class RecurrentL2T:
             # Apply the gradients for RND
             if self.rnd_optimizer:
                 self.rnd_optimizer.step()
+            # Apply the gradients for Student
+            nn.utils.clip_grad_norm_(self.student_policy.parameters(), self.max_grad_norm)
+            self.student_optimizer.step()
 
             # Store the losses
             mean_value_loss += value_loss.item()
@@ -415,6 +539,8 @@ class RecurrentL2T:
             # Symmetry loss
             if mean_symmetry_loss is not None:
                 mean_symmetry_loss += symmetry_loss.item()
+            # Student loss
+            mean_student_loss += student_loss.item()
 
         # Divide the losses by the number of updates
         num_updates = self.num_learning_epochs * self.num_mini_batches
@@ -425,6 +551,7 @@ class RecurrentL2T:
             mean_rnd_loss /= num_updates
         if mean_symmetry_loss is not None:
             mean_symmetry_loss /= num_updates
+        mean_student_loss /= num_updates
 
         # Clear the storage
         self.storage.clear()
@@ -434,6 +561,7 @@ class RecurrentL2T:
             "value_function": mean_value_loss,
             "surrogate": mean_surrogate_loss,
             "entropy": mean_entropy,
+            "student": mean_student_loss,
         }
         if self.rnd:
             loss_dict["rnd"] = mean_rnd_loss
@@ -486,10 +614,6 @@ class RecurrentL2T:
         for param in all_params:
             if param.grad is not None:
                 numel = param.numel()
-                # Copy data back from shared buffer
-                param.grad.data.copy_(all_grads[offset : offset + numel].view_as(param.grad.data))
-                # Update the offset for the next parameter
-                offset += numel
                 # Copy data back from shared buffer
                 param.grad.data.copy_(all_grads[offset : offset + numel].view_as(param.grad.data))
                 # Update the offset for the next parameter
