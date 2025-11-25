@@ -26,8 +26,6 @@ class RolloutStorage:
             self.action_mean: torch.Tensor | None = None
             self.action_sigma: torch.Tensor | None = None
             self.hidden_states: tuple[HiddenState, HiddenState] = (None, None)
-            # For L2T: student hidden states (teacher uses hidden_states above)
-            self.student_hidden_states: tuple[HiddenState, HiddenState] | None = None
 
         def clear(self) -> None:
             self.__init__()
@@ -70,12 +68,9 @@ class RolloutStorage:
             self.returns = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
             self.advantages = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
 
-        # For RNN networks (teacher hidden states)
+        # For RNN networks
         self.saved_hidden_state_a = None
         self.saved_hidden_state_c = None
-        # For L2T: student hidden states
-        self.saved_student_hidden_state_a = None
-        self.saved_student_hidden_state_c = None
 
         # Counter for the number of transitions stored
         self.step = 0
@@ -103,11 +98,7 @@ class RolloutStorage:
             self.sigma[self.step].copy_(transition.action_sigma)
 
         # For RNN networks
-        # Save teacher hidden states (standard PPO)
         self._save_hidden_states(transition.hidden_states)
-        # Save student hidden states (L2T only, if provided)
-        if transition.student_hidden_states is not None:
-            self._save_student_hidden_states(transition.student_hidden_states)
 
         # Increment the counter
         self.step += 1
@@ -132,33 +123,6 @@ class RolloutStorage:
         for i in range(len(hidden_state_a)):
             self.saved_hidden_state_a[i][self.step].copy_(hidden_state_a[i])
             self.saved_hidden_state_c[i][self.step].copy_(hidden_state_c[i])
-
-    def _save_student_hidden_states(self, hidden_states: tuple[HiddenState, HiddenState]) -> None:
-        """Save student hidden states for L2T."""
-        # Handle None case (first call before LSTM is initialized)
-        if hidden_states == (None, None) or hidden_states[0] is None or hidden_states[1] is None:
-            # Skip saving if hidden states are not initialized yet
-            # They will be initialized on the next forward pass
-            return
-        
-        hidden_state_a = hidden_states[0] if isinstance(hidden_states[0], tuple) else (hidden_states[0],)
-        hidden_state_c = hidden_states[1] if isinstance(hidden_states[1], tuple) else (hidden_states[1],)
-        
-        # Initialize storage if needed
-        if self.saved_student_hidden_state_a is None:
-            self.saved_student_hidden_state_a = [
-                torch.zeros(self.observations.shape[0], *hidden_state_a[i].shape, device=self.device)
-                for i in range(len(hidden_state_a))
-            ]
-            self.saved_student_hidden_state_c = [
-                torch.zeros(self.observations.shape[0], *hidden_state_c[i].shape, device=self.device)
-                for i in range(len(hidden_state_c))
-            ]
-        
-        # Copy the states
-        for i in range(len(hidden_state_a)):
-            self.saved_student_hidden_state_a[i][self.step].copy_(hidden_state_a[i])
-            self.saved_student_hidden_state_c[i][self.step].copy_(hidden_state_c[i])
 
     def clear(self) -> None:
         self.step = 0
@@ -307,29 +271,6 @@ class RolloutStorage:
                     hidden_state_c_batch[0] if len(hidden_state_c_batch) == 1 else hidden_state_c_batch
                 )
 
-                # For L2T: extract student hidden states if available
-                student_hidden_state_a_batch = None
-                student_hidden_state_c_batch = None
-                if self.saved_student_hidden_state_a is not None:
-                    student_hidden_state_a_batch = [
-                        saved_hidden_state.permute(2, 0, 1, 3)[last_was_done][first_traj:last_traj]
-                        .transpose(1, 0)
-                        .contiguous()
-                        for saved_hidden_state in self.saved_student_hidden_state_a
-                    ]
-                    student_hidden_state_c_batch = [
-                        saved_hidden_state.permute(2, 0, 1, 3)[last_was_done][first_traj:last_traj]
-                        .transpose(1, 0)
-                        .contiguous()
-                        for saved_hidden_state in self.saved_student_hidden_state_c
-                    ]
-                    student_hidden_state_a_batch = (
-                        student_hidden_state_a_batch[0] if len(student_hidden_state_a_batch) == 1 else student_hidden_state_a_batch
-                    )
-                    student_hidden_state_c_batch = (
-                        student_hidden_state_c_batch[0] if len(student_hidden_state_c_batch) == 1 else student_hidden_state_c_batch
-                    )
-
                 # Yield the mini-batch
                 yield (
                     obs_batch,
@@ -345,11 +286,6 @@ class RolloutStorage:
                         hidden_state_c_batch,
                     ),
                     masks_batch,
-                    # For L2T: student hidden states (None if not available)
-                    (
-                        student_hidden_state_a_batch,
-                        student_hidden_state_c_batch,
-                    ),
                 )
 
                 first_traj = last_traj

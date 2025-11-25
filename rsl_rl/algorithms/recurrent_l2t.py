@@ -13,7 +13,7 @@ from tensordict import TensorDict
 
 from rsl_rl.modules import ActorCritic, ActorCriticRecurrent
 from rsl_rl.modules.rnd import RandomNetworkDistillation
-from rsl_rl.storage import RolloutStorage
+from rsl_rl.storage import L2TRolloutStorage
 from rsl_rl.utils import string_to_callable
 
 
@@ -126,8 +126,8 @@ class RecurrentL2T:
         self.num_timesteps = 0  # Total timesteps processed
 
         # Create rollout storage
-        self.storage: RolloutStorage | None = None
-        self.transition = RolloutStorage.Transition()
+        self.storage: L2TRolloutStorage | None = None
+        self.transition = L2TRolloutStorage.Transition()
 
         # PPO parameters
         self.clip_param = clip_param
